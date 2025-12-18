@@ -1,9 +1,6 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
-import folium
-from folium.plugins import FastMarkerCluster
-from streamlit_folium import st_folium
 from pathlib import Path
 from data_prep import clean_df
 
@@ -67,8 +64,8 @@ year_range = st.sidebar.slider(
     (max(min(years), 1900), min(max(years), 2025)),
 )
 
-class_options = ["All classes"] + sorted(df["recclass"].unique().tolist())
-selected_class = st.sidebar.selectbox("Meteorite class/type", class_options)
+class_options = ["All classes"] + sorted(df["category"].unique().tolist())
+selected_class = st.sidebar.selectbox("Meteorite Category", class_options)
 
 mass_min_value = float(df["mass (g)"].min())
 mass_max_value = float(df["mass (g)"].max())
@@ -85,8 +82,8 @@ mass_upper = st.sidebar.number_input(
     "Mass max (g)",
     min_value=mass_lower,
     max_value=mass_max_value,
-    value=mass_default_high,
-    step=max(1.0, mass_default_high / 200),
+    value=mass_max_value,
+    step=max(1.0, mass_max_value / 200),
 )
 
 search_query = st.sidebar.text_input("Search by meteorite name", "")
@@ -98,7 +95,7 @@ filtered = df[
     & (df["mass (g)"] <= mass_upper)
 ]
 if selected_class != "All classes":
-    filtered = filtered[filtered["recclass"] == selected_class]
+    filtered = filtered[filtered["category"] == selected_class]
 if search_query:
     filtered = filtered[
         filtered["name"].str.contains(search_query, case=False, na=False)
@@ -115,27 +112,45 @@ col_kpi3.metric("Years Covered", f"{year_range[0]}-{year_range[1]}")
 
 overview, deep_dive_tab = st.tabs(["Overview", "Deep Dive"])
 with overview:
-    # don't like the folium map
-    st.header("Meteorite Landing Locations")
-    df_map = filtered.dropna(subset=["reclat", "reclong"]).copy()
-
-    if not df_map.empty:
-        center_lat = float(df_map["reclat"].mean())
-        center_lon = float(df_map["reclong"].mean())
-    else:
-        center_lat, center_lon = 0.0, 0.0
-
-    folium_map = folium.Map(
-        location=[center_lat, center_lon],
-        tiles="CartoDB positron",
-        zoom_start=2,
+    world = alt.topo_feature("https://vega.github.io/vega-datasets/data/world-110m.json", "countries")
+    background = (
+        alt.Chart(world)
+        .mark_geoshape(fill="#e0e0e0", stroke="white", strokeWidth=0.6)
     )
 
-    if not df_map.empty:
-        locations = df_map[["reclat", "reclong"]].values.tolist()
-        FastMarkerCluster(locations).add_to(folium_map)
+    map_df =filtered[~((filtered["reclat"] == 0) & (filtered["reclong"] == 0))
+].copy()
+    max_mass = map_df["mass (g)"].max()
 
-    st_folium(folium_map, width=900, height=480)
+    points = (
+        alt.Chart(map_df)
+        .mark_circle(opacity=0.6, stroke="white", strokeWidth=0.4)
+        .encode(
+            longitude='reclong:Q',
+            latitude='reclat:Q',
+            size = alt.Size("mass (g):Q",scale=alt.Scale(
+                type="sqrt",
+                domain=[0, max_mass],
+                range=[5, 500],   
+                clamp=True
+            ), legend=alt.Legend(title="Mass (g)")),
+            color=alt.Color(
+                "category:N",
+                scale=alt.Scale(domain=list(CATEGORY_COLORS.keys()), range=list(CATEGORY_COLORS.values())),
+                legend=alt.Legend(title="Classification")
+            ),
+            tooltip=[
+                alt.Tooltip("name:N", title="Name"),
+                alt.Tooltip("year:Q", title="Year"),
+                alt.Tooltip('GeoLocation', title="Location"),
+                alt.Tooltip("mass (g):Q", title="Mass (g)", format=","),
+                alt.Tooltip("recclass:N", title="Class"),
+                alt.Tooltip("fall:N", title="Fall"),
+            ],
+        ))
+
+    map_chart = (background + points).project(type='naturalEarth1').properties(width=1000, height=500)
+    st.altair_chart(map_chart, use_container_width=True)
 
     col_timeline, col_mass = st.columns(2)
 
@@ -156,25 +171,42 @@ with overview:
             title='Number of Meteorites'
         ),
         tooltip=['year', 'count(year)']).properties(
-        title='Recorded Meteorite Landings Over Time',
         height=350).configure_view(
         strokeWidth=0).configure_axis(grid=False)
         st.altair_chart(timeline_chart, use_container_width=True)
 
     with col_mass:
-        st.subheader("Distribution of Meteorite Mass")
-        mass_chart = (
-            alt.Chart(filtered)
-            .mark_bar()
-            .encode(
-                x=alt.X(
-                    "mass (g):Q", bin=alt.Bin(maxbins=40), title="Mass (grams)"
-                ),
-                y=alt.Y("count():Q", title="Number of Meteorites"),
-                tooltip=[alt.Tooltip("count():Q", title="Number in Bin")],
-            )
-            .properties(height=350)
+        st.subheader("Distribution of Meteorite Mass Over Selected Period")
+        base = (
+        alt.Chart(filtered)
+        .transform_aggregate(
+            q1="q1(mass (g))",
+            med="median(mass (g))",
+            q3="q3(mass (g))",
+            groupby=["year"]
         )
+        )
+
+        label=[
+        alt.Tooltip("year:O", title="Year"),
+        alt.Tooltip("q1:Q", title="Q1 (25%)", format=","),
+        alt.Tooltip("med:Q", title="Median", format=","),
+        alt.Tooltip("q3:Q", title="Q3 (75%)", format=","),
+        ]
+
+        band = base.mark_area(opacity=0.25).encode(
+        x=alt.X("year:O", title="Year"),
+        y=alt.Y("q1:Q", title="Mass (g)"),
+        y2="q3:Q",
+        tooltip=label
+        )
+
+        line = base.mark_line().encode(
+            x="year:O",
+            y="med:Q",
+            tooltip=label
+        )
+        mass_chart = (band + line).properties(height=350)
         st.altair_chart(mass_chart, use_container_width=True)
 
 
@@ -205,9 +237,8 @@ with deep_dive_tab:
                 legend=None,
             ),
             tooltip=[
-                alt.Tooltip("recclass:N", title="Class"),
-                alt.Tooltip("mass (g):Q", title="Mass (g)", format=","),
                 alt.Tooltip("category:N", title="Category"),
+                alt.Tooltip("mass (g):Q", title="Mass (g)", format=","),
             ],
         )
         .properties(width=400)
@@ -225,7 +256,7 @@ with deep_dive_tab:
                 "fall:N",
                 sort=fall_order,
                 axis=alt.Axis(labelAngle=0),
-                title="Recovery status"
+                title="Meteorites Observed while Falling or Found",
             ),
             y=alt.Y(
                 "mass (g):Q",
@@ -235,9 +266,8 @@ with deep_dive_tab:
             ),
             color=alt.Color("fall:N", legend=None),
             tooltip=[
-                alt.Tooltip("recclass:N", title="Class"),
+                alt.Tooltip("fall:N", title="Fall Status"),
                 alt.Tooltip("mass (g):Q", title="Mass (g)", format=","),
-                alt.Tooltip("category:N", title="Category"),
             ],
         )
         .properties(width=400)
